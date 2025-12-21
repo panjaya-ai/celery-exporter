@@ -146,7 +146,6 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
             registry=self.registry,
         )
 
-
     def scrape(self):
         if (
             self.worker_timeout_seconds > 0
@@ -240,8 +239,8 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
 
             # ORI: collect working workers samples by prefix 
             active_worker_by_prefix = defaultdict(float)
-            for s in self.worker_tasks_active._samples(): 
-                if m := re.match("^(.*)-\\w+-\\w+$",  str(s.labels.get('hostname'))): 
+            for s in self.worker_tasks_active._samples():
+                if m := re.match("^(.*)-\\w+-\\w+$", str(s.labels.get('hostname'))):
                     active_worker_by_prefix[m.group(1)] += s.value
 
             # request workers to response active queues
@@ -256,12 +255,18 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                     processes_per_queue[name] += concurrency_per_worker.get(worker, 0)
 
                     # ORI: map queues to worker prefix 
-                    if name not in self.queue_mapping: 
-                        if m := re.match("^\\w+@(.*)-\\w+-\\w+$",  worker): 
+                    if name not in self.queue_mapping:
+                        if m := re.match("^\\w+@(.*)-\\w+-\\w+$", worker):
                             self.queue_mapping[name] = m.group(1)
-
+            # TAMIR : allow to get all queues from redis and not only those of active workers
+            celery_prefix = list(self.queue_cache)[0].split(".")[0]
+            # if we in redis get all keys start with celery_prefix
+            if transport in ["redis", "rediss", "sentinel"]:
+                redis_client = connection.default_channel.client
+                for key in redis_client.scan_iter(f"_kombu.binding.{celery_prefix}*"):
+                    queue_name = key.decode("utf-8").split("_kombu.binding.")[1]
+                    self.queue_cache.add(queue_name)
             for queue in self.queue_cache:
-                
                 if transport in ["amqp", "amqps", "memory"]:
                     consumer_count = rabbitmq_queue_consumer_count(connection, queue)
                     self.celery_active_consumer_count.labels(queue_name=queue).set(
@@ -276,13 +281,21 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                 )
 
                 # ORI: actual working workers and idle workers
-                if queue in self.queue_mapping: 
+                if queue in self.queue_mapping:
                     actual_working = active_worker_by_prefix[self.queue_mapping[queue]]
                     self.celery_working_process_count.labels(queue_name=queue).set(
                         actual_working
                     )
                     self.celery_idle_process_count.labels(queue_name=queue).set(
-                        processes_per_queue[queue]-actual_working
+                        processes_per_queue[queue] - actual_working
+                    )
+                else:
+                    # TAMIR: if 0 pods so we want to set 0 to working and idle
+                    self.celery_working_process_count.labels(queue_name=queue).set(
+                        0
+                    )
+                    self.celery_idle_process_count.labels(queue_name=queue).set(
+                        0
                     )
 
                 length = queue_length(transport, connection, queue)
