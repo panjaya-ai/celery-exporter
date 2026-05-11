@@ -115,6 +115,17 @@ def _comma_seperated_argument(_ctx, _param, value):
     help="Prefix all metrics with a string. "
     "This option replaces the 'celery_*' part with a custom prefix. ",
 )
+@click.option(
+    "--metrics-loop-interval",
+    type=int,
+    default=2,
+    show_default=True,
+    envvar="CE_METRICS_LOOP_INTERVAL",
+    help="Interval in seconds between background broker-collection runs. "
+    "/metrics serves the gauges populated by this loop, so it never blocks "
+    "on the broker. Override via the CE_METRICS_LOOP_INTERVAL environment "
+    "variable.",
+)
 def cli(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     broker_url,
     broker_transport_option,
@@ -130,6 +141,7 @@ def cli(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too
     generic_hostname_task_sent_metric,
     queues,
     metric_prefix,
+    metrics_loop_interval,
 ):  # pylint: disable=unused-argument
     formatted_buckets = list(map(float, buckets.split(",")))
     ctx = click.get_current_context()
@@ -140,4 +152,5 @@ def cli(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too
         generic_hostname_task_sent_metric,
         queues,
         metric_prefix,
+        metrics_loop_interval,
     ).run(ctx.params)

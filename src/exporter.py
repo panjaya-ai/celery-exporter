@@ -4,6 +4,7 @@ import re
 import sys
 import time
 from collections import defaultdict
+from threading import Lock, Thread
 from typing import Callable, Optional
 
 from celery import Celery
@@ -29,15 +30,23 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         generic_hostname_task_sent_metric=False,
         initial_queues=None,
         metric_prefix="celery_",
+        metrics_loop_interval_seconds=2,
     ):
         self.registry = CollectorRegistry(auto_describe=True)
         self.queue_cache = set(initial_queues or [])
+        self.queue_mapping = {}
         self.worker_last_seen = {}
         self.worker_timeout_seconds = worker_timeout_seconds
         self.purge_offline_worker_metrics_after_seconds = (
             purge_offline_worker_metrics_seconds
         )
         self.generic_hostname_task_sent_metric = generic_hostname_task_sent_metric
+        self._metrics_loop_interval_seconds = metrics_loop_interval_seconds
+        # Serialises the bulk gauge-write at the end of track_queue_metrics
+        # so concurrent iterations (or future writers) can't interleave
+        # mid-snapshot. Does not synchronise with /metrics reads — see
+        # plan file for the trade-off.
+        self._metrics_write_lock = Lock()
         self.state_counters = {
             "task-sent": Counter(
                 f"{metric_prefix}task_sent",
@@ -108,6 +117,12 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
             registry=self.registry,
             buckets=buckets or Histogram.DEFAULT_BUCKETS,
         )
+        self.celery_collection_duration_seconds = Gauge(
+            f"{metric_prefix}collection_duration_seconds",
+            "Wall-clock duration of the last background broker-collection cycle "
+            "(inspect() + Redis SCAN + per-queue length lookups).",
+            registry=self.registry,
+        )
         self.celery_queue_length = Gauge(
             f"{metric_prefix}queue_length",
             "The number of message in broker queue.",
@@ -132,6 +147,18 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
             ["queue_name"],
             registry=self.registry,
         )
+        self.celery_working_process_count = Gauge(
+            f"{metric_prefix}working_process_count",
+            "The number of actual working processes in broker queue.",
+            ["queue_name"],
+            registry=self.registry,
+        )
+        self.celery_idle_process_count = Gauge(
+            f"{metric_prefix}idle_process_count",
+            "The number of idle processes in broker queue.",
+            ["queue_name"],
+            registry=self.registry,
+        )
 
     def scrape(self):
         if (
@@ -140,6 +167,20 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         ):
             self.track_timed_out_workers()
         self.track_queue_metrics()
+
+    def _metrics_loop(self):
+        # Background loop that refreshes the broker-derived gauges. One
+        # iteration at a time. KeyboardInterrupt / SystemExit propagate so
+        # the thread can be torn down by signals; broad Exception is logged
+        # so a single bad iteration can't kill the loop.
+        while True:
+            time.sleep(self._metrics_loop_interval_seconds)
+            try:
+                self.scrape()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("background metrics collection failed")
 
     def forget_worker(self, hostname):
         if hostname in self.worker_last_seen:
@@ -201,6 +242,7 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                     self.purge_worker_metrics(hostname)
 
     def track_queue_metrics(self):
+        t_total_start = time.time()
         with self.app.connection() as connection:  # type: ignore
             transport = connection.info()["transport"]
             acceptable_transports = [
@@ -224,6 +266,12 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
             processes_per_queue = defaultdict(int)
             workers_per_queue = defaultdict(int)
 
+            # ORI: collect working workers samples by prefix 
+            active_worker_by_prefix = defaultdict(float)
+            for s in self.worker_tasks_active._samples():
+                if m := re.match("^(.*)-\\w+-\\w+$", str(s.labels.get('hostname'))):
+                    active_worker_by_prefix[m.group(1)] += s.value
+
             # request workers to response active queues
             # we need to cache queue info in exporter in case all workers are offline
             # so that no worker response to exporter will make active_queues return None
@@ -235,22 +283,69 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                     workers_per_queue[name] += 1
                     processes_per_queue[name] += concurrency_per_worker.get(worker, 0)
 
+                    # ORI: map queues to worker prefix 
+                    if name not in self.queue_mapping:
+                        if m := re.match("^\\w+@(.*)-\\w+-\\w+$", worker):
+                            self.queue_mapping[name] = m.group(1)
+            # TAMIR : allow to get all queues from redis and not only those of active workers
+            celery_prefix = list(self.queue_cache)[0].split(".")[0]
+            # if we in redis get all keys start with celery_prefix
+            if transport in ["redis", "rediss", "sentinel"]:
+                redis_client = connection.default_channel.client
+                for key in redis_client.scan_iter(f"_kombu.binding.{celery_prefix}*"):
+                    queue_name = key.decode("utf-8").split("_kombu.binding.")[1]
+                    self.queue_cache.add(queue_name)
+            # Collect into local dicts; the actual gauge writes happen at
+            # the end of the function under self._metrics_write_lock so
+            # /metrics sees a near-atomic snapshot rather than partial
+            # updates while broker I/O is still in flight.
+            new_active_consumer_count = {}
+            new_active_process_count = {}
+            new_active_worker_count = {}
+            new_working_process_count = {}
+            new_idle_process_count = {}
+            new_queue_length = {}
+
             for queue in self.queue_cache:
                 if transport in ["amqp", "amqps", "memory"]:
-                    consumer_count = rabbitmq_queue_consumer_count(connection, queue)
-                    self.celery_active_consumer_count.labels(queue_name=queue).set(
-                        consumer_count
+                    new_active_consumer_count[queue] = rabbitmq_queue_consumer_count(
+                        connection, queue
                     )
 
-                self.celery_active_process_count.labels(queue_name=queue).set(
-                    processes_per_queue[queue]
-                )
-                self.celery_active_worker_count.labels(queue_name=queue).set(
-                    workers_per_queue[queue]
-                )
+                new_active_process_count[queue] = processes_per_queue[queue]
+                new_active_worker_count[queue] = workers_per_queue[queue]
+
+                # ORI: actual working workers and idle workers
+                if queue in self.queue_mapping:
+                    actual_working = active_worker_by_prefix[self.queue_mapping[queue]]
+                    new_working_process_count[queue] = actual_working
+                    new_idle_process_count[queue] = (
+                        processes_per_queue[queue] - actual_working
+                    )
+                else:
+                    # TAMIR: if 0 pods so we want to set 0 to working and idle
+                    new_working_process_count[queue] = 0
+                    new_idle_process_count[queue] = 0
+
                 length = queue_length(transport, connection, queue)
                 if length is not None:
-                    self.celery_queue_length.labels(queue_name=queue).set(length)
+                    new_queue_length[queue] = length
+
+        duration = time.time() - t_total_start
+        with self._metrics_write_lock:
+            for queue, value in new_active_consumer_count.items():
+                self.celery_active_consumer_count.labels(queue_name=queue).set(value)
+            for queue, value in new_active_process_count.items():
+                self.celery_active_process_count.labels(queue_name=queue).set(value)
+            for queue, value in new_active_worker_count.items():
+                self.celery_active_worker_count.labels(queue_name=queue).set(value)
+            for queue, value in new_working_process_count.items():
+                self.celery_working_process_count.labels(queue_name=queue).set(value)
+            for queue, value in new_idle_process_count.items():
+                self.celery_idle_process_count.labels(queue_name=queue).set(value)
+            for queue, value in new_queue_length.items():
+                self.celery_queue_length.labels(queue_name=queue).set(value)
+            self.celery_collection_duration_seconds.set(duration)
 
     def track_task_event(self, event):
         self.state.event(event)
@@ -381,13 +476,24 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         for key in self.state_counters:
             handlers[key] = self.track_task_event
 
+        # Run an initial broker collection synchronously before the http
+        # server starts. If the broker is unreachable this raises and the
+        # pod fails to start (k8s will restart it) — preferable to serving
+        # an empty registry forever.
+        self.track_queue_metrics()
+        Thread(target=self._metrics_loop, daemon=True).start()
+        logger.info(
+            "Started background metrics loop, interval={}s",
+            self._metrics_loop_interval_seconds,
+        )
+
         with self.app.connection() as connection:  # type: ignore
             start_http_server(
                 self.registry,
                 connection,
                 click_params["host"],
                 click_params["port"],
-                self.scrape,
+                self._metrics_write_lock,
             )
             while True:
                 try:
