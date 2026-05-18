@@ -126,6 +126,25 @@ def _comma_seperated_argument(_ctx, _param, value):
     "on the broker. Override via the CE_METRICS_LOOP_INTERVAL environment "
     "variable.",
 )
+@click.option(
+    "--max-workers-in-memory",
+    type=int,
+    default=200,
+    show_default=True,
+    envvar="CE_MAX_WORKERS_IN_MEMORY",
+    help="Cap on the celery.events.state.State workers LRU. Override via "
+    "the CE_MAX_WORKERS_IN_MEMORY environment variable. Useful for "
+    "shrinking on staging (e.g. 30) to validate the leak fix in Prometheus.",
+)
+@click.option(
+    "--max-tasks-in-memory",
+    type=int,
+    default=100,
+    show_default=True,
+    envvar="CE_MAX_TASKS_IN_MEMORY",
+    help="Cap on the celery.events.state.State tasks LRU. Override via "
+    "the CE_MAX_TASKS_IN_MEMORY environment variable.",
+)
 def cli(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     broker_url,
     broker_transport_option,
@@ -142,6 +161,8 @@ def cli(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too
     queues,
     metric_prefix,
     metrics_loop_interval,
+    max_workers_in_memory,
+    max_tasks_in_memory,
 ):  # pylint: disable=unused-argument
     formatted_buckets = list(map(float, buckets.split(",")))
     ctx = click.get_current_context()
@@ -153,4 +174,6 @@ def cli(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too
         queues,
         metric_prefix,
         metrics_loop_interval,
+        max_workers_in_memory,
+        max_tasks_in_memory,
     ).run(ctx.params)

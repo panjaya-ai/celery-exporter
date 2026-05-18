@@ -31,6 +31,8 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         initial_queues=None,
         metric_prefix="celery_",
         metrics_loop_interval_seconds=2,
+        max_workers_in_memory=200,
+        max_tasks_in_memory=100,
     ):
         self.registry = CollectorRegistry(auto_describe=True)
         self.queue_cache = set(initial_queues or [])
@@ -42,6 +44,8 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         )
         self.generic_hostname_task_sent_metric = generic_hostname_task_sent_metric
         self._metrics_loop_interval_seconds = metrics_loop_interval_seconds
+        self._max_workers_in_memory = max_workers_in_memory
+        self._max_tasks_in_memory = max_tasks_in_memory
         # Serialises the bulk gauge-write at the end of track_queue_metrics
         # so concurrent iterations (or future writers) can't interleave
         # mid-snapshot. Does not synchronise with /metrics reads — see
@@ -463,7 +467,29 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         if ssl_options is not None:
             self.app.conf["broker_use_ssl"] = ssl_options
 
-        self.state = self.app.events.State()  # type: ignore
+        # The exporter only reads back the task/worker we just fed in
+        # (see track_task_event and track_worker_heartbeat). It does not
+        # need celery-flower-sized history. Celery's defaults (10000
+        # tasks / 5000 workers, see
+        # https://github.com/celery/celery/blob/v5.4.0/celery/events/state.py#L408-L410)
+        # saturate in hours at prod throughput and were the dominant
+        # driver of the slow OOM-sawtooth on this pod.
+        #
+        # Defaults here: max_workers_in_memory=200 covers current
+        # per-deployment max replica counts (lips 100, vocals 30,
+        # ingest 20, analyze 10, gpu 10, dubbing 5 → ~175 worker pods
+        # peak) with headroom; max_tasks_in_memory=100 is generous
+        # for our read-immediately-after-write usage (one-line gap
+        # between state.event(event) and state.tasks.get(uuid) in
+        # track_task_event — the just-added task is the most-recently-
+        # used and cannot be evicted before we read it back).
+        # Both are overridable from helm via
+        # CE_MAX_WORKERS_IN_MEMORY / CE_MAX_TASKS_IN_MEMORY so we can
+        # shrink on staging (e.g. 30) and watch Prometheus.
+        self.state = self.app.events.State(  # type: ignore
+            max_workers_in_memory=self._max_workers_in_memory,
+            max_tasks_in_memory=self._max_tasks_in_memory,
+        )
         self.retry_interval = click_params["retry_interval"]
         if self.retry_interval:
             logger.debug("Using retry_interval of {} seconds", self.retry_interval)
