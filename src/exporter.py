@@ -267,10 +267,10 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
             processes_per_queue = defaultdict(int)
             workers_per_queue = defaultdict(int)
 
-            # ORI: collect working workers samples by prefix 
+            # ORI: collect working workers samples by prefix
             active_worker_by_prefix = defaultdict(float)
             for s in self.worker_tasks_active._samples():
-                if m := re.match("^(.*)-\\w+-\\w+$", str(s.labels.get('hostname'))):
+                if m := re.match("^(.*)-\\w+-\\w+$", str(s.labels.get("hostname"))):
                     active_worker_by_prefix[m.group(1)] += s.value
 
             # request workers to response active queues
@@ -284,14 +284,13 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                     workers_per_queue[name] += 1
                     processes_per_queue[name] += concurrency_per_worker.get(worker, 0)
 
-                    # ORI: map queues to worker prefix 
+                    # ORI: map queues to worker prefix
                     if name not in self.queue_mapping:
                         if m := re.match("^\\w+@(.*)-\\w+-\\w+$", worker):
                             self.queue_mapping[name] = m.group(1)
             # TAMIR : allow to get all queues from redis and not only those of active workers
-            celery_prefix = list(self.queue_cache)[0].split(".")[0]
-            # if we in redis get all keys start with celery_prefix
-            if transport in ["redis", "rediss", "sentinel"]:
+            if transport in ["redis", "rediss", "sentinel"] and self.queue_cache:
+                celery_prefix = next(iter(self.queue_cache)).split(".")[0]
                 redis_client = connection.default_channel.client
                 for key in redis_client.scan_iter(f"_kombu.binding.{celery_prefix}*"):
                     queue_name = key.decode("utf-8").split("_kombu.binding.")[1]

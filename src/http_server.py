@@ -128,6 +128,23 @@ def debug_mailbox():
     return "\n".join(lines), 200, {"Content-Type": "text/plain"}
 
 
+def _serve_with_error_logging(app, host, port):
+    # The waitress thread was previously daemon=True with `_quiet=True`
+    # and no exception handling, so any startup failure (port bind error,
+    # import error, missing kombu deps in the slim image) was silently
+    # swallowed — the main thread logged "Started celery-exporter..."
+    # while the bind never happened. This wrapper surfaces the actual
+    # exception so we can see why startup fails in the container.
+    try:
+        logger.info("waitress: about to bind host={} port={}", host, port)
+        serve(app, host=host, port=port, _quiet=False)
+    except SystemExit:
+        raise
+    except BaseException:  # pylint: disable=broad-except
+        logger.exception("waitress crashed during serve()")
+        raise
+
+
 def start_http_server(registry, celery_connection, host, port, metrics_lock, exporter=None):
     app = Flask(__name__)
     app.config["registry"] = registry
@@ -136,9 +153,8 @@ def start_http_server(registry, celery_connection, host, port, metrics_lock, exp
     app.config["exporter"] = exporter
     app.register_blueprint(blueprint)
     Thread(
-        target=serve,
-        args=(app,),
-        kwargs=dict(host=host, port=port, _quiet=True),
+        target=_serve_with_error_logging,
+        args=(app, host, port),
         daemon=True,
     ).start()
     logger.info("Started celery-exporter at host='{}' on port='{}'", host, port)
