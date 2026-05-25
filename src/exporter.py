@@ -3,6 +3,7 @@ import json
 import re
 import sys
 import time
+import tracemalloc
 from collections import defaultdict
 from threading import Lock, Thread
 from typing import Callable, Optional
@@ -429,6 +430,12 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
         logger.debug("Updated gauge='{}' value='{}'", self.celery_worker_up._name, up)
 
     def run(self, click_params):
+        # Diagnostic-only build: tracemalloc traces every Python allocation
+        # so /debug/tracemalloc can return the top callsites by size. 10
+        # frames per traceback give enough context to attribute leaks to
+        # specific call paths without too much overhead. Intended for
+        # short-lived (hours/days) diagnostic deployments, not steady-state.
+        tracemalloc.start(10)
         logger.remove()
         logger.add(sys.stdout, level=click_params["log_level"])
         self.app = Celery(broker=click_params["broker_url"])
@@ -494,6 +501,7 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                 click_params["host"],
                 click_params["port"],
                 self._metrics_write_lock,
+                exporter=self,
             )
             while True:
                 try:

@@ -1,3 +1,5 @@
+import sys
+import tracemalloc
 from threading import Thread
 
 import kombu.exceptions
@@ -54,11 +56,84 @@ def health():
     return f"Connected to the broker {conn.as_uri()}"
 
 
-def start_http_server(registry, celery_connection, host, port, metrics_lock):
+@blueprint.route("/debug/tracemalloc")
+def debug_tracemalloc():
+    # Return the top-N Python allocation sites by total bytes. Hit this
+    # periodically while reproducing the leak; growth in a specific file:line
+    # is the smoking gun. Output is plain text formatted exactly like
+    # `tracemalloc.Snapshot.statistics()`.
+    if not tracemalloc.is_tracing():
+        return ("tracemalloc not started", 503, {"Content-Type": "text/plain"})
+    n = int(request.args.get("n", "30"))
+    snapshot = tracemalloc.take_snapshot()
+    top_by_lineno = snapshot.statistics("lineno")[:n]
+    by_file = snapshot.statistics("filename")
+    total_bytes = sum(stat.size for stat in by_file)
+    current, peak = tracemalloc.get_traced_memory()
+    lines = [
+        f"tracemalloc current: {current / 1024 / 1024:.2f} MiB",
+        f"tracemalloc peak:    {peak / 1024 / 1024:.2f} MiB",
+        f"sum of all stats:    {total_bytes / 1024 / 1024:.2f} MiB",
+        "",
+        f"Top {n} allocation sites by total bytes (group_by=lineno):",
+    ]
+    for i, stat in enumerate(top_by_lineno, 1):
+        lines.append(f"#{i}: {stat}")
+        # Include the first frame of the traceback for context.
+        if stat.traceback:
+            for frame in list(stat.traceback)[:3]:
+                lines.append(f"    {frame.filename}:{frame.lineno}")
+    lines.append("")
+    lines.append("Top 15 files by total bytes:")
+    for stat in by_file[:15]:
+        lines.append(f"  {stat.size / 1024:.1f} KiB  count={stat.count}  {stat.traceback[0].filename}")
+    return "\n".join(lines), 200, {"Content-Type": "text/plain"}
+
+
+@blueprint.route("/debug/mailbox")
+def debug_mailbox():
+    # Inspect self.app.control.mailbox.unclaimed — the kombu pidbox
+    # accumulator at kombu/pidbox.py:191. Stash for orphan reply tickets;
+    # has no cleanup path. If this dict grows monotonically across calls
+    # to this endpoint, it's a contributor to the exporter's RSS leak.
+    exporter = current_app.config.get("exporter")
+    if exporter is None or not hasattr(exporter, "app"):
+        return ("exporter not available", 503, {"Content-Type": "text/plain"})
+    try:
+        mailbox = exporter.app.control.mailbox
+    except Exception as e:  # pylint: disable=broad-except
+        return (f"mailbox not available: {e!r}", 503, {"Content-Type": "text/plain"})
+    unclaimed = getattr(mailbox, "unclaimed", None)
+    if unclaimed is None:
+        return ("mailbox has no unclaimed attribute", 503, {"Content-Type": "text/plain"})
+    # Snapshot a shallow copy of the keys so we don't iterate a dict that
+    # the metrics-loop thread might be mutating. dict.copy() is atomic.
+    items = list(unclaimed.items())
+    total_entries = sum(len(deque) for _, deque in items)
+    approx_bytes = sys.getsizeof(unclaimed)
+    for k, v in items:
+        approx_bytes += sys.getsizeof(k) + sys.getsizeof(v)
+        for item in v:
+            approx_bytes += sys.getsizeof(item)
+    top = sorted(((str(k), len(v)) for k, v in items), key=lambda x: -x[1])[:20]
+    lines = [
+        f"unclaimed tickets: {len(items)}",
+        f"total entries across all deques: {total_entries}",
+        f"approx total bytes (shallow getsizeof): {approx_bytes}",
+        "",
+        "Top 20 tickets by entry count:",
+    ]
+    for ticket, count in top:
+        lines.append(f"  {ticket}: {count}")
+    return "\n".join(lines), 200, {"Content-Type": "text/plain"}
+
+
+def start_http_server(registry, celery_connection, host, port, metrics_lock, exporter=None):
     app = Flask(__name__)
     app.config["registry"] = registry
     app.config["celery_connection"] = celery_connection
     app.config["metrics_lock"] = metrics_lock
+    app.config["exporter"] = exporter
     app.register_blueprint(blueprint)
     Thread(
         target=serve,
