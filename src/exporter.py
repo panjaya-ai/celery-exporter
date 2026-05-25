@@ -259,9 +259,19 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
                 )
                 return
 
+            # Reuse one Inspect instance per cycle instead of two (commit
+            # 7e3f475's message claimed this but never actually wired it).
+            # Also drop the Mailbox's accumulated unclaimed-replies dict
+            # (kombu/pidbox.py:191,381) — late replies for past broadcasts
+            # have no consumer and otherwise pile up forever in
+            # self.app.control.mailbox.unclaimed, the dominant ongoing
+            # leak driving the celery-exporter OOM-sawtooth.
+            inspect = self.app.control.inspect()
+            self.app.control.mailbox.unclaimed.clear()
+
             concurrency_per_worker = {
                 worker: len(stats["pool"].get("processes", []))
-                for worker, stats in (self.app.control.inspect().stats() or {}).items()
+                for worker, stats in (inspect.stats() or {}).items()
             }
             processes_per_queue = defaultdict(int)
             workers_per_queue = defaultdict(int)
@@ -275,7 +285,7 @@ class Exporter:  # pylint: disable=too-many-instance-attributes,too-many-branche
             # request workers to response active queues
             # we need to cache queue info in exporter in case all workers are offline
             # so that no worker response to exporter will make active_queues return None
-            queues = self.app.control.inspect().active_queues() or {}
+            queues = inspect.active_queues() or {}
             for worker, info_list in queues.items():
                 for queue_info in info_list:
                     name = queue_info["name"]
